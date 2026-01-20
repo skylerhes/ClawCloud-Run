@@ -1,277 +1,41 @@
 """
 ClawCloud 自动登录脚本
-- 支持 Hysteria2 代理（用于通过人机验证）
 - 自动检测区域跳转（如 ap-southeast-1.console.claw.cloud）
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
 """
 
+import base64
 import os
+import random
+import re
 import sys
 import time
-import base64
-import re
-import json
-import subprocess
-import signal
+from urllib.parse import urlparse
+
 import requests
-from urllib.parse import urlparse, parse_qs, unquote
 from playwright.sync_api import sync_playwright
 
 # ==================== 配置 ====================
+# 代理配置 (留空则不使用)
+# 格式: socks5://user:pass@host:port 或 http://user:pass@host:port
+PROXY_DSN = os.environ.get("PROXY_DSN", "").strip()
+
 # 固定登录入口，OAuth后会自动跳转到实际区域
-LOGIN_ENTRY_URL = "https://console.run.claw.cloud"
+LOGIN_ENTRY_URL = "https://console.run.claw.cloud/login"
 SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
 DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
-
-# 代理配置
-LOCAL_PROXY_PORT = 51080  # 本地 SOCKS5 代理端口
-LOCAL_HTTP_PORT = 51081   # 本地 HTTP 代理端口
-
-
-class Hysteria2Proxy:
-    """Hysteria2 代理管理器"""
-    
-    def __init__(self):
-        self.hy2_url = os.environ.get('PROXY_HY2', '').strip()
-        self.process = None
-        self.config_file = '/tmp/hy2_config.yaml'
-        self.enabled = False
-        
-        if self.hy2_url:
-            print("✅ 检测到 Hysteria2 代理配置")
-            self.enabled = True
-        else:
-            print("ℹ️ 未配置 Hysteria2 代理，将直接连接")
-    
-    def parse_url(self):
-        """
-        解析 Hysteria2 URL
-        格式: hysteria2://password@host:port?sni=xxx&alpn=xxx&insecure=1#name
-        """
-        if not self.hy2_url:
-            return None
-        
-        try:
-            # 移除 hysteria2:// 前缀
-            url = self.hy2_url
-            if url.startswith('hysteria2://'):
-                url = url[12:]
-            elif url.startswith('hy2://'):
-                url = url[6:]
-            
-            # 分离 fragment（#后面的名称）
-            if '#' in url:
-                url, _ = url.rsplit('#', 1)
-            
-            # 分离查询参数
-            params = {}
-            if '?' in url:
-                url, query = url.split('?', 1)
-                params = parse_qs(query)
-            
-            # 解析 password@host:port
-            if '@' in url:
-                password, host_port = url.rsplit('@', 1)
-                password = unquote(password)
-            else:
-                password = ''
-                host_port = url
-            
-            # 解析 host:port
-            if ':' in host_port:
-                host, port = host_port.rsplit(':', 1)
-                port = int(port)
-            else:
-                host = host_port
-                port = 443
-            
-            config = {
-                'server': f"{host}:{port}",
-                'auth': password,
-                'tls': {
-                    'sni': params.get('sni', [host])[0],
-                    'insecure': params.get('insecure', ['0'])[0] == '1'
-                },
-                'socks5': {
-                    'listen': f"127.0.0.1:{LOCAL_PROXY_PORT}"
-                },
-                'http': {
-                    'listen': f"127.0.0.1:{LOCAL_HTTP_PORT}"
-                }
-            }
-            
-            # 添加 ALPN（如果有）
-            if 'alpn' in params:
-                alpn = params['alpn'][0]
-                # 可能是逗号分隔的多个值
-                config['tls']['alpn'] = alpn.split(',')
-            
-            print(f"  📍 服务器: {host}:{port}")
-            print(f"  🔐 认证: {password[:4]}...{password[-4:] if len(password) > 8 else '***'}")
-            print(f"  🌐 SNI: {config['tls']['sni']}")
-            print(f"  🔓 跳过验证: {config['tls']['insecure']}")
-            
-            return config
-            
-        except Exception as e:
-            print(f"❌ 解析 Hysteria2 URL 失败: {e}")
-            return None
-    
-    def generate_config(self, config):
-        """生成 Hysteria2 配置文件"""
-        import yaml
-        
-        with open(self.config_file, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
-        
-        print(f"✅ 已生成配置文件: {self.config_file}")
-        return self.config_file
-    
-    def generate_config_json(self, config):
-        """生成 Hysteria2 JSON 配置文件（备选）"""
-        json_config = {
-            "server": config['server'],
-            "auth": config['auth'],
-            "tls": config['tls'],
-            "socks5": config['socks5'],
-            "http": config['http']
-        }
-        
-        json_file = '/tmp/hy2_config.json'
-        with open(json_file, 'w') as f:
-            json.dump(json_config, f, indent=2)
-        
-        return json_file
-    
-    def start(self):
-        """启动 Hysteria2 客户端"""
-        if not self.enabled:
-            return True
-        
-        config = self.parse_url()
-        if not config:
-            print("❌ 无法解析代理配置")
-            return False
-        
-        # 尝试使用 YAML 配置
-        try:
-            import yaml
-            config_file = self.generate_config(config)
-        except ImportError:
-            # 如果没有 PyYAML，使用 JSON
-            print("⚠️ PyYAML 未安装，使用 JSON 配置")
-            config_file = self.generate_config_json(config)
-        
-        try:
-            # 启动 Hysteria2
-            print("🚀 启动 Hysteria2 代理...")
-            
-            self.process = subprocess.Popen(
-                ['hysteria', 'client', '-c', config_file],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            
-            # 等待代理启动
-            time.sleep(3)
-            
-            # 检查进程是否还在运行
-            if self.process.poll() is not None:
-                stdout, stderr = self.process.communicate()
-                print(f"❌ Hysteria2 启动失败")
-                print(f"  stdout: {stdout.decode()}")
-                print(f"  stderr: {stderr.decode()}")
-                return False
-            
-            # 测试代理连接
-            if self.test_proxy():
-                print(f"✅ Hysteria2 代理已启动")
-                print(f"  SOCKS5: 127.0.0.1:{LOCAL_PROXY_PORT}")
-                print(f"  HTTP: 127.0.0.1:{LOCAL_HTTP_PORT}")
-                return True
-            else:
-                print("❌ 代理测试失败")
-                self.stop()
-                return False
-                
-        except FileNotFoundError:
-            print("❌ 找不到 hysteria 命令，请确保已安装")
-            return False
-        except Exception as e:
-            print(f"❌ 启动 Hysteria2 失败: {e}")
-            return False
-    
-    def test_proxy(self, retries=3):
-        """测试代理是否可用"""
-        for i in range(retries):
-            try:
-                proxies = {
-                    'http': f'socks5://127.0.0.1:{LOCAL_PROXY_PORT}',
-                    'https': f'socks5://127.0.0.1:{LOCAL_PROXY_PORT}'
-                }
-                
-                r = requests.get(
-                    'https://api.ipify.org?format=json',
-                    proxies=proxies,
-                    timeout=10
-                )
-                
-                if r.status_code == 200:
-                    ip = r.json().get('ip', 'unknown')
-                    print(f"✅ 代理测试成功，出口 IP: {ip}")
-                    return True
-                    
-            except Exception as e:
-                print(f"  代理测试 {i+1}/{retries} 失败: {e}")
-                time.sleep(2)
-        
-        return False
-    
-    def stop(self):
-        """停止 Hysteria2 客户端"""
-        if self.process:
-            try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=5)
-                print("✅ Hysteria2 已停止")
-            except Exception as e:
-                print(f"⚠️ 停止 Hysteria2 时出错: {e}")
-                try:
-                    self.process.kill()
-                except:
-                    pass
-    
-    def get_playwright_proxy(self):
-        """获取 Playwright 代理配置"""
-        if not self.enabled:
-            return None
-        
-        return {
-            'server': f'socks5://127.0.0.1:{LOCAL_PROXY_PORT}'
-        }
 
 
 class Telegram:
     """Telegram 通知"""
     
-    def __init__(self, proxy=None):
+    def __init__(self):
         self.token = os.environ.get('TG_BOT_TOKEN')
         self.chat_id = os.environ.get('TG_CHAT_ID')
         self.ok = bool(self.token and self.chat_id)
-        self.proxy = proxy
-    
-    def _get_proxies(self):
-        """获取请求代理配置"""
-        if self.proxy and self.proxy.enabled:
-            return {
-                'http': f'socks5://127.0.0.1:{LOCAL_PROXY_PORT}',
-                'https': f'socks5://127.0.0.1:{LOCAL_PROXY_PORT}'
-            }
-        return None
     
     def send(self, msg):
         if not self.ok:
@@ -280,19 +44,10 @@ class Telegram:
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
-                timeout=30,
-                proxies=self._get_proxies()
+                timeout=30
             )
         except:
-            # 如果代理失败，尝试直连
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
-                    timeout=30
-                )
-            except:
-                pass
+            pass
     
     def photo(self, path, caption=""):
         if not self.ok or not os.path.exists(path):
@@ -303,21 +58,10 @@ class Telegram:
                     f"https://api.telegram.org/bot{self.token}/sendPhoto",
                     data={"chat_id": self.chat_id, "caption": caption[:1024]},
                     files={"photo": f},
-                    timeout=60,
-                    proxies=self._get_proxies()
+                    timeout=60
                 )
         except:
-            # 如果代理失败，尝试直连
-            try:
-                with open(path, 'rb') as f:
-                    requests.post(
-                        f"https://api.telegram.org/bot{self.token}/sendPhoto",
-                        data={"chat_id": self.chat_id, "caption": caption[:1024]},
-                        files={"photo": f},
-                        timeout=60
-                    )
-            except:
-                pass
+            pass
     
     def flush_updates(self):
         """刷新 offset 到最新，避免读到旧消息"""
@@ -327,8 +71,7 @@ class Telegram:
             r = requests.get(
                 f"https://api.telegram.org/bot{self.token}/getUpdates",
                 params={"timeout": 0},
-                timeout=10,
-                proxies=self._get_proxies()
+                timeout=10
             )
             data = r.json()
             if data.get("ok") and data.get("result"):
@@ -355,8 +98,7 @@ class Telegram:
                 r = requests.get(
                     f"https://api.telegram.org/bot{self.token}/getUpdates",
                     params={"timeout": 20, "offset": offset},
-                    timeout=30,
-                    proxies=self._get_proxies()
+                    timeout=30
                 )
                 data = r.json()
                 if not data.get("ok"):
@@ -438,19 +180,15 @@ class AutoLogin:
         self.username = os.environ.get('GH_USERNAME')
         self.password = os.environ.get('GH_PASSWORD')
         self.gh_session = os.environ.get('GH_SESSION', '').strip()
-        
-        # 初始化代理
-        self.proxy = Hysteria2Proxy()
-        
-        self.tg = Telegram(proxy=self.proxy)
+        self.tg = Telegram()
         self.secret = SecretUpdater()
         self.shots = []
         self.logs = []
         self.n = 0
         
         # 区域相关
-        self.detected_region = None  # 检测到的区域，如 "ap-southeast-1"
-        self.region_base_url = None  # 检测到的区域基础 URL
+        self.detected_region = 'eu-central-1'  # 检测到的区域，如 "ap-southeast-1"
+        self.region_base_url = 'https://eu-central-1.run.claw.cloud'  # 检测到的区域基础 URL
         
     def log(self, msg, level="INFO"):
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
@@ -473,6 +211,10 @@ class AutoLogin:
             try:
                 el = page.locator(s).first
                 if el.is_visible(timeout=3000):
+                    # 模拟人类随机延迟
+                    time.sleep(random.uniform(0.5, 1.5))
+                    el.hover() # 先悬停
+                    time.sleep(random.uniform(0.2, 0.5))
                     el.click()
                     self.log(f"已点击: {desc}", "SUCCESS")
                     return True
@@ -553,8 +295,9 @@ class AutoLogin:
             # 通过 Telegram 发送
             self.tg.send(f"""🔑 <b>新 Cookie</b>
 
-请更新 Secret <b>GH_SESSION</b>:
-<code>{value}</code>""")
+请更新 Secret <b>GH_SESSION</b> (点击查看):
+<tg-spoiler>{value}</tg-spoiler>
+""")
             self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
@@ -646,13 +389,37 @@ class AutoLogin:
         """处理 TOTP 验证码输入（通过 Telegram 发送 /code 123456）"""
         self.log("需要输入验证码", "WARN")
         shot = self.shot(page, "两步验证_code")
-        
-        # 先尝试点击"Use an authentication app"或类似按钮（如果在 mobile 页面）
+
+        # 如果是 Security Key (webauthn) 页面，尝试切换到 Authenticator App
+        if 'two-factor/webauthn' in page.url:
+            self.log("检测到 Security Key 页面，尝试切换...", "INFO")
+            try:
+                # 点击 "More options"
+                more_options_button = page.locator('button:has-text("More options")').first
+                if more_options_button.is_visible(timeout=3000):
+                    more_options_button.click()
+                    self.log("已点击 'More options'", "SUCCESS")
+                    time.sleep(1) # 等待菜单出现
+                    self.shot(page, "点击more_options后")
+
+                    # 点击 "Authenticator app"
+                    auth_app_button = page.locator('button:has-text("Authenticator app")').first
+                    if auth_app_button.is_visible(timeout=2000):
+                        auth_app_button.click()
+                        self.log("已选择 'Authenticator app'", "SUCCESS")
+                        time.sleep(2)
+                        page.wait_for_load_state('networkidle', timeout=15000)
+                        shot = self.shot(page, "切换到验证码输入页") # 更新截图
+            except Exception as e:
+                self.log(f"切换验证方式时出错: {e}", "WARN")
+
+        # (保留) 先尝试点击"Use an authentication app"或类似按钮（如果在 mobile 页面）
         try:
             more_options = [
                 'a:has-text("Use an authentication app")',
                 'a:has-text("Enter a code")',
                 'button:has-text("Use an authentication app")',
+                'button:has-text("Authenticator app")',
                 '[href*="two-factor/app"]'
             ]
             for sel in more_options:
@@ -669,29 +436,29 @@ class AutoLogin:
                     pass
         except:
             pass
-        
+
         # 发送提示并等待验证码
         self.tg.send(f"""🔐 <b>需要验证码登录</b>
 
-请在 Telegram 里发送：
+用户{self.username}正在登录，请在 Telegram 里发送：
 <code>/code 你的6位验证码</code>
 
 等待时间：{TWO_FACTOR_WAIT} 秒""")
         if shot:
             self.tg.photo(shot, "两步验证页面")
-        
+
         self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
         code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
-        
+
         if not code:
             self.log("等待验证码超时", "ERROR")
             self.tg.send("❌ <b>等待验证码超时</b>")
             return False
-        
+
         # 不打印验证码明文，只提示收到
         self.log("收到验证码，正在填入...", "SUCCESS")
         self.tg.send("✅ 收到验证码，正在填入...")
-        
+
         # 常见 OTP 输入框 selector（优先级排序）
         selectors = [
             'input[autocomplete="one-time-code"]',
@@ -701,15 +468,17 @@ class AutoLogin:
             'input#otp',
             'input[inputmode="numeric"]'
         ]
-        
+
         for sel in selectors:
             try:
                 el = page.locator(sel).first
                 if el.is_visible(timeout=2000):
-                    el.fill(code)
+                    el.click()
+                    time.sleep(random.uniform(0.2, 0.5))
+                    el.type(code, delay=random.randint(50, 150))
                     self.log(f"已填入验证码", "SUCCESS")
                     time.sleep(1)
-                    
+
                     # 优先点击 Verify 按钮，不行再 Enter
                     submitted = False
                     verify_btns = [
@@ -727,15 +496,16 @@ class AutoLogin:
                                 break
                         except:
                             pass
-                    
+
                     if not submitted:
+                        time.sleep(random.uniform(0.3, 0.8))
                         page.keyboard.press("Enter")
                         self.log("已按 Enter 提交", "SUCCESS")
-                    
+
                     time.sleep(3)
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
-                    
+
                     # 检查是否通过
                     if "github.com/sessions/two-factor/" not in page.url:
                         self.log("验证码验证通过！", "SUCCESS")
@@ -747,7 +517,7 @@ class AutoLogin:
                         return False
             except:
                 pass
-        
+
         self.log("没找到验证码输入框", "ERROR")
         self.tg.send("❌ <b>没找到验证码输入框</b>")
         return False
@@ -758,8 +528,19 @@ class AutoLogin:
         self.shot(page, "github_登录页")
         
         try:
-            page.locator('input[name="login"]').fill(self.username)
-            page.locator('input[name="password"]').fill(self.password)
+            # 模拟人工输入
+            user_input = page.locator('input[name="login"]')
+            user_input.click()
+            time.sleep(random.uniform(0.3, 0.8))
+            user_input.type(self.username, delay=random.randint(30, 100))
+
+            time.sleep(random.uniform(0.5, 1.0))
+
+            pass_input = page.locator('input[name="password"]')
+            pass_input.click()
+            time.sleep(random.uniform(0.3, 0.8))
+            pass_input.type(self.password, delay=random.randint(30, 100))
+
             self.log("已输入凭据")
         except Exception as e:
             self.log(f"输入失败: {e}", "ERROR")
@@ -898,12 +679,11 @@ class AutoLogin:
             return
         
         region_info = f"\n<b>区域:</b> {self.detected_region or '默认'}" if self.detected_region else ""
-        proxy_info = "\n<b>代理:</b> Hysteria2 ✅" if self.proxy.enabled else ""
         
         msg = f"""<b>🤖 ClawCloud 自动登录</b>
 
 <b>状态:</b> {"✅ 成功" if ok else "❌ 失败"}
-<b>用户:</b> {self.username}{region_info}{proxy_info}
+<b>用户:</b> {self.username}{region_info}
 <b>时间:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}"""
         
         if err:
@@ -918,7 +698,10 @@ class AutoLogin:
                 for s in self.shots[-3:]:
                     self.tg.photo(s, s)
             else:
-                self.tg.photo(self.shots[-1], "完成")
+                # for s in self.shots[-3:]:
+                #     self.tg.photo(s, s)
+                if self.shots:
+                   self.tg.photo(self.shots[-1], "完成")
     
     def run(self):
         print("\n" + "="*50)
@@ -928,7 +711,6 @@ class AutoLogin:
         self.log(f"用户名: {self.username}")
         self.log(f"Session: {'有' if self.gh_session else '无'}")
         self.log(f"密码: {'有' if self.password else '无'}")
-        self.log(f"代理: {'Hysteria2' if self.proxy.enabled else '无'}")
         self.log(f"登录入口: {LOGIN_ENTRY_URL}")
         
         if not self.username or not self.password:
@@ -936,157 +718,183 @@ class AutoLogin:
             self.notify(False, "凭据未配置")
             sys.exit(1)
         
-        # 启动代理
-        if self.proxy.enabled:
-            if not self.proxy.start():
-                self.log("代理启动失败，继续尝试直连...", "WARN")
-                self.proxy.enabled = False
-        
-        try:
-            with sync_playwright() as p:
-                # 配置浏览器启动参数
-                browser_args = ['--no-sandbox', '--disable-blink-features=AutomationControlled']
-                
-                # 获取代理配置
-                proxy_config = self.proxy.get_playwright_proxy()
-                
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=browser_args
-                )
-                
-                # 创建带代理的上下文
-                context_options = {
-                    'viewport': {'width': 1920, 'height': 1080},
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-                
-                if proxy_config:
-                    context_options['proxy'] = proxy_config
-                    self.log(f"Playwright 使用代理: {proxy_config['server']}", "INFO")
-                
-                context = browser.new_context(**context_options)
-                page = context.new_page()
-                
+        with sync_playwright() as p:
+            # 代理配置解析
+            launch_args = {
+                "headless": True,
+                "args": [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-infobars',
+                    '--exclude-switches=enable-automation',
+                ]
+            }
+
+            if PROXY_DSN:
                 try:
-                    # 预加载 Cookie
-                    if self.gh_session:
-                        try:
-                            context.add_cookies([
-                                {'name': 'user_session', 'value': self.gh_session, 'domain': 'github.com', 'path': '/'},
-                                {'name': 'logged_in', 'value': 'yes', 'domain': 'github.com', 'path': '/'}
-                            ])
-                            self.log("已加载 Session Cookie", "SUCCESS")
-                        except:
-                            self.log("加载 Cookie 失败", "WARN")
-                    
-                    # 1. 访问 ClawCloud 登录入口
-                    self.log("步骤1: 打开 ClawCloud 登录页", "STEP")
-                    page.goto(SIGNIN_URL, timeout=60000)
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                    time.sleep(2)
-                    self.shot(page, "clawcloud")
-                    
-                    # 检查当前 URL，可能已经自动跳转到区域
-                    current_url = page.url
-                    self.log(f"当前 URL: {current_url}")
-                    
-                    if 'signin' not in current_url.lower() and 'claw.cloud' in current_url:
-                        self.log("已登录！", "SUCCESS")
-                        # 检测区域
-                        self.detect_region(current_url)
-                        self.keepalive(page)
-                        # 提取并保存新 Cookie
-                        new = self.get_session(context)
-                        if new:
-                            self.save_cookie(new)
-                        self.notify(True)
-                        print("\n✅ 成功！\n")
-                        return
-                    
-                    # 2. 点击 GitHub
-                    self.log("步骤2: 点击 GitHub", "STEP")
-                    if not self.click(page, [
-                        'button:has-text("GitHub")',
-                        'a:has-text("GitHub")',
-                        '[data-provider="github"]'
-                    ], "GitHub"):
-                        self.log("找不到按钮", "ERROR")
-                        self.notify(False, "找不到 GitHub 按钮")
-                        sys.exit(1)
-                    
-                    time.sleep(3)
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                    self.shot(page, "点击后")
-                    
-                    url = page.url
-                    self.log(f"当前: {url}")
-                    
-                    # 3. GitHub 登录
-                    self.log("步骤3: GitHub 认证", "STEP")
-                    
-                    if 'github.com/login' in url or 'github.com/session' in url:
-                        if not self.login_github(page, context):
-                            self.shot(page, "登录失败")
-                            self.notify(False, "GitHub 登录失败")
-                            sys.exit(1)
-                    elif 'github.com/login/oauth/authorize' in url:
-                        self.log("Cookie 有效", "SUCCESS")
-                        self.oauth(page)
-                    
-                    # 4. 等待重定向（会自动检测区域）
-                    self.log("步骤4: 等待重定向", "STEP")
-                    if not self.wait_redirect(page):
-                        self.shot(page, "重定向失败")
-                        self.notify(False, "重定向失败")
-                        sys.exit(1)
-                    
-                    self.shot(page, "重定向成功")
-                    
-                    # 5. 验证
-                    self.log("步骤5: 验证", "STEP")
-                    current_url = page.url
-                    if 'claw.cloud' not in current_url or 'signin' in current_url.lower():
-                        self.notify(False, "验证失败")
-                        sys.exit(1)
-                    
-                    # 再次确认区域检测
-                    if not self.detected_region:
-                        self.detect_region(current_url)
-                    
-                    # 6. 保活（使用检测到的区域 URL）
+                    p_url = urlparse(PROXY_DSN)
+                    proxy_config = {
+                        "server": f"{p_url.scheme}://{p_url.hostname}:{p_url.port}"
+                    }
+                    if p_url.username:
+                        proxy_config["username"] = p_url.username
+                    if p_url.password:
+                        proxy_config["password"] = p_url.password
+
+                    launch_args["proxy"] = proxy_config
+                    self.log(f"启用代理: {proxy_config['server']}")
+                except Exception as e:
+                    self.log(f"代理配置解析失败: {e}", "ERROR")
+
+            browser = p.chromium.launch(**launch_args)
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+            )
+            page = context.new_page()
+            page.add_init_script("""
+                // 基础反检测
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+
+                // 模拟插件 (Headless Chrome 默认无插件)
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+
+                // 模拟语言
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+
+                // 模拟 window.chrome
+                window.chrome = { runtime: {} };
+
+                // 绕过权限检测
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+                );
+            """)
+            
+            try:
+                # 预加载 Cookie
+                if self.gh_session:
+                    try:
+                        context.add_cookies([
+                            {'name': 'user_session', 'value': self.gh_session, 'domain': 'github.com', 'path': '/'},
+                            {'name': 'logged_in', 'value': 'yes', 'domain': 'github.com', 'path': '/'}
+                        ])
+                        self.log("已加载 Session Cookie", "SUCCESS")
+                    except:
+                        self.log("加载 Cookie 失败", "WARN")
+                
+                # 1. 访问 ClawCloud 登录入口
+                self.log("步骤1: 打开 ClawCloud 登录页", "STEP")
+                page.goto(SIGNIN_URL, timeout=60000)
+                page.wait_for_load_state('networkidle', timeout=60000)
+                time.sleep(2)
+                self.shot(page, "clawcloud")
+                
+                # 检查当前 URL，可能已经自动跳转到区域
+                current_url = page.url
+                self.log(f"当前 URL: {current_url}")
+  
+            
+               # 2. 点击 GitHub
+                self.log("步骤2: 点击 GitHub", "STEP")
+                if not self.click(page, [
+                    'button:has-text("GitHub")',
+                    'a:has-text("GitHub")',
+                    '[data-provider="github"]'
+                ], "GitHub"):
+                    self.log("找不到按钮", "ERROR")
+                    self.notify(False, "找不到 GitHub 按钮")
+                    sys.exit(1)
+                
+                time.sleep(3)
+                page.wait_for_load_state('networkidle', timeout=120000)
+                self.shot(page, "点击后")
+                url = page.url
+                self.log(f"当前: {url}")
+
+                if 'signin' not in url.lower() and 'claw.cloud' in url and  'github.com' not in url:
+                    self.log("已登录！", "SUCCESS")
+                    # 检测区域
+                    self.detect_region(url)
                     self.keepalive(page)
-                    
-                    # 7. 提取并保存新 Cookie
-                    self.log("步骤6: 更新 Cookie", "STEP")
+                    # 提取并保存新 Cookie
                     new = self.get_session(context)
                     if new:
                         self.save_cookie(new)
-                    else:
-                        self.log("未获取到新 Cookie", "WARN")
-                    
                     self.notify(True)
-                    print("\n" + "="*50)
-                    print("✅ 成功！")
-                    if self.detected_region:
-                        print(f"📍 区域: {self.detected_region}")
-                    if self.proxy.enabled:
-                        print("🌐 代理: Hysteria2")
-                    print("="*50 + "\n")
-                    
-                except Exception as e:
-                    self.log(f"异常: {e}", "ERROR")
-                    self.shot(page, "异常")
-                    import traceback
-                    traceback.print_exc()
-                    self.notify(False, str(e))
+                    print("\n✅ 成功！\n")
+                    return
+                
+
+                
+                # 3. GitHub 登录
+                self.log("步骤3: GitHub 认证", "STEP")
+                
+                if 'github.com/login' in url or 'github.com/session' in url:
+                    if not self.login_github(page, context):
+                        self.shot(page, "登录失败")
+                        self.notify(False, "GitHub 登录失败")
+                        sys.exit(1)
+                elif 'github.com/login/oauth/authorize' in url:
+                    self.log("Cookie 有效", "SUCCESS")
+                    self.oauth(page)
+                
+                # 4. 等待重定向（会自动检测区域）
+                self.log("步骤4: 等待重定向", "STEP")
+                if not self.wait_redirect(page):
+                    self.shot(page, "重定向失败")
+                    self.notify(False, "重定向失败")
                     sys.exit(1)
-                finally:
-                    browser.close()
-        
-        finally:
-            # 停止代理
-            self.proxy.stop()
+                
+                self.shot(page, "重定向成功")
+                
+                # 5. 验证
+                self.log("步骤5: 验证", "STEP")
+                current_url = page.url
+                if 'claw.cloud' not in current_url or 'signin' in current_url.lower():
+                    self.notify(False, "验证失败")
+                    sys.exit(1)
+                
+                # 再次确认区域检测
+                if not self.detected_region:
+                    self.detect_region(current_url)
+                
+                # 6. 保活（使用检测到的区域 URL）
+                self.keepalive(page)
+                
+                # 7. 提取并保存新 Cookie
+                self.log("步骤6: 更新 Cookie", "STEP")
+                new = self.get_session(context)
+                if new:
+                    self.save_cookie(new)
+                else:
+                    self.log("未获取到新 Cookie", "WARN")
+                
+                self.notify(True)
+                print("\n" + "="*50)
+                print("✅ 成功！")
+                if self.detected_region:
+                    print(f"📍 区域: {self.detected_region}")
+                print("="*50 + "\n")
+                
+            except Exception as e:
+                self.log(f"异常: {e}", "ERROR")
+                self.shot(page, "异常")
+                import traceback
+                traceback.print_exc()
+                self.notify(False, str(e))
+                sys.exit(1)
+            finally:
+                browser.close()
 
 
 if __name__ == "__main__":
